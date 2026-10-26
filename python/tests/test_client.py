@@ -536,3 +536,109 @@ def test_audit_log_records_decisions_and_costs(tmp_path):
     ]
     assert entry["amount_units"] == 20_000
     assert entry["dry_run"] is False
+
+
+# --- Recheck pack spending (drift stage) -------------------------------------
+
+class PackWorld:
+    """A pack-aware fake world. The StallRow fake answers /v1/recheck
+    with a scripted payload when the body carries a known pack_id (no
+    payment header ever), an error status for an exhausted pack, and
+    serves pack-balance reads. It records every request so tests can
+    prove no PAYMENT-SIGNATURE was ever sent for a pack check."""
+
+    def __init__(self, *, balance=249, pack_status="BASELINE"):
+        self.settled = FakeSettledMcp(settled_unknown)
+        self.balance = balance
+        self.pack_status = pack_status
+        self.pack_spends = 0
+        self.balance_reads = 0
+        self.signed_requests = 0
+
+    def __call__(self, request):
+        if request.headers.get("PAYMENT-SIGNATURE"):
+            self.signed_requests += 1
+        host = request.url.host
+        path = request.url.path
+        if host == "settled.tools":
+            return self.settled(request)
+        if host == "stall-row-production.up.railway.app":
+            body = json.loads(request.content or b"{}")
+            if path == "/v1/recheck/pack-balance":
+                self.balance_reads += 1
+                return httpx.Response(200, json={
+                    "pack_id": body.get("pack_id"),
+                    "credits_total": 250,
+                    "credits_remaining": self.balance,
+                    "expires_at": "2027-01-23T00:00:00Z",
+                    "expired": False,
+                })
+            if path == "/v1/recheck":
+                pack_id = body.get("pack_id")
+                if pack_id == "pack_test":
+                    self.pack_spends += 1
+                    return httpx.Response(200, json=recheck_response(self.pack_status))
+                if pack_id == "pack_empty":
+                    return httpx.Response(402, json={
+                        "error": "pack exhausted", "code": "pack_exhausted",
+                    })
+                return httpx.Response(404, json={"error": "unknown pack_id"})
+        raise AssertionError(f"unexpected request: {host}{path}")
+
+
+def make_pack_guard(tmp_path, world, *, account="live", pack_id="pack_test"):
+    http = httpx.Client(transport=httpx.MockTransport(world))
+    cfg = GuardConfig(recheck_pack_id=pack_id)
+    cfg.store_path = str(tmp_path / "guard.db")
+    cfg.audit_log_path = str(tmp_path / "audit.jsonl")
+    acct = Account.create() if account == "live" else None
+    return GuardedClient(account=acct, config=cfg, http=http, now=Clock())
+
+
+def test_pack_spend_uses_credit_not_payment(tmp_path):
+    world = PackWorld(balance=249)
+    guard = make_pack_guard(tmp_path, world)
+    decision = guard.evaluate(TARGET, 20_000)
+    drift = [s for s in decision.stages if s.name == "drift"][0]
+    assert drift.outcome == "pass"
+    assert drift.cost_units == 0
+    assert "pack credit" in drift.detail
+    assert "249 of 250" in drift.detail
+    assert world.pack_spends == 1
+    assert world.balance_reads == 1
+    assert world.signed_requests == 0  # nothing was signed or settled
+
+
+def test_pack_low_balance_warns(tmp_path):
+    world = PackWorld(balance=10)
+    guard = make_pack_guard(tmp_path, world)
+    decision = guard.evaluate(TARGET, 20_000)
+    drift = [s for s in decision.stages if s.name == "drift"][0]
+    assert "PACK LOW" in drift.detail
+    assert "never falls back" in drift.detail
+
+
+def test_pack_exhausted_fails_without_per_call_fallback(tmp_path):
+    world = PackWorld()
+    guard = make_pack_guard(tmp_path, world, pack_id="pack_empty")
+    decision = guard.evaluate(TARGET, 20_000)
+    drift = [s for s in decision.stages if s.name == "drift"][0]
+    assert drift.outcome == "warn"  # default drift_failure policy
+    assert "no per-call" in drift.detail and "fallback" in drift.detail
+    assert world.pack_spends == 0
+    assert world.signed_requests == 0  # the guard did NOT pay per-call instead
+
+
+def test_pack_not_spent_in_dry_run(tmp_path):
+    world = PackWorld()
+    guard = make_pack_guard(tmp_path, world, account=None)
+    decision = guard.evaluate(TARGET, 20_000)
+    drift = [s for s in decision.stages if s.name == "drift"][0]
+    assert drift.outcome == "skipped"
+    assert world.pack_spends == 0
+
+
+def test_recheck_pack_id_from_env():
+    cfg = GuardConfig.from_env({"X402_GUARD_RECHECK_PACK_ID": "pack_abc"})
+    assert cfg.recheck_pack_id == "pack_abc"
+    assert GuardConfig.from_env({}).recheck_pack_id is None

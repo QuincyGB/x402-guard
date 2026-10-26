@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "x402-guard"
-version = "0.1.0"
+version = "0.1.1"
 description = "Payment-path seatbelt for x402 buyer agents: Settled pre-flight, endpoint drift checks (StallRow Recheck), RouteVerdict trust gates, and spend caps enforced before any payment is signed."
 readme = "README.md"
 requires-python = ">=3.10"

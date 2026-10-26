@@ -26,6 +26,12 @@ through Verdict Row **before anything is signed**:
    guard's local ledger *before* signing. The guard refuses first;
    it never signs and discovers later.
 
+Stage 2 drift checks can spend from a StallRow recheck pack
+(config `recheckPackId`): $0.004 per uncached check, no per-check
+settlement, and the guard warns at 25 and 10 credits remaining
+(balance reads are free). Without a pack, drift checks pay $0.005
+per uncached check as before.
+
 Every decision — allow, warn, block, with the reason chain and what
 the checks cost — is appended to a local audit log (JSONL) you can
 read. Blocks throw `GuardBlockedError` carrying the full decision.

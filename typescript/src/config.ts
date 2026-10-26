@@ -22,6 +22,11 @@ export interface GuardConfigOptions {
     /** Stage 2: StallRow Recheck drift check, cached for the TTL. */
     driftEnabled?: boolean;
     recheckUrl?: string;
+    /** When set, drift checks spend credits from this StallRow recheck
+     * pack ($1.00 = 250 checks on one endpoint) instead of paying
+     * $0.005 per uncached check. An exhausted (402) or expired (410)
+     * pack fails the stage — never a silent per-call fallback. */
+    recheckPackId?: string | null;
     driftTtlSeconds?: number;
     priceChangeBlockPct?: number;
     /** What happens when the Recheck call itself fails. */
@@ -47,6 +52,7 @@ export interface GuardConfig {
     settledTimeoutMs: number;
     driftEnabled: boolean;
     recheckUrl: string;
+    recheckPackId: string | null;
     driftTtlSeconds: number;
     priceChangeBlockPct: number;
     driftFailure: FailurePolicy;
@@ -69,6 +75,7 @@ export function resolveConfig(options: GuardConfigOptions = {}): GuardConfig {
         settledTimeoutMs: options.settledTimeoutMs ?? 10_000,
         driftEnabled: options.driftEnabled ?? true,
         recheckUrl: options.recheckUrl ?? DEFAULT_RECHECK_URL,
+        recheckPackId: options.recheckPackId ?? null,
         driftTtlSeconds: options.driftTtlSeconds ?? 86_400,
         priceChangeBlockPct: options.priceChangeBlockPct ?? 20,
         driftFailure: options.driftFailure ?? "warn",
@@ -132,6 +139,7 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
         settledMcpUrl: get("SETTLED_MCP_URL"),
         driftEnabled: getBool("DRIFT_ENABLED"),
         recheckUrl: get("RECHECK_URL"),
+        recheckPackId: get("RECHECK_PACK_ID"),
         driftTtlSeconds: getFloat("DRIFT_TTL_SECONDS"),
         priceChangeBlockPct: getFloat("PRICE_CHANGE_BLOCK_PCT"),
         driftFailure: failure("DRIFT_FAILURE"),

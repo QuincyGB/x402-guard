@@ -11,6 +11,11 @@ The pipeline (same semantics in the TypeScript package):
      is new to this buyer, or the cached look is older than the TTL
      (default 24h), pay Recheck to fingerprint the target's live
      payment terms and diff them against the guard's local store.
+     With `recheck_pack_id` configured, the check instead spends one
+     credit from a prepaid StallRow recheck pack ($1.00 = 250 checks
+     on one endpoint): no per-check settlement, and an exhausted or
+     expired pack fails the stage — it never falls back to paying
+     per call.
      payTo or asset changed = hard block. Price moved more than the
      configured % (default 20%) = block. Schema/description/other
      changes = warn. Inside the TTL the cached result is used and
@@ -379,6 +384,29 @@ class GuardedClient:
             return StageResult(
                 "drift", "skipped", f"{note}; dry-run never pays for checks"
             )
+        if cfg.recheck_pack_id:
+            # Pack path: the pack id is the credential. StallRow's
+            # middleware lets a pack-bearing request through unpaid and
+            # the handler spends one credit — no settlement, no budget
+            # authorization, cost_units 0. An exhausted/expired/unknown
+            # pack fails the stage under drift_failure; the guard NEVER
+            # falls back to per-call payment silently.
+            try:
+                resp = self._call_recheck_with_pack(target_url)
+            except ServiceError as exc:
+                return self._failure(
+                    "drift", cfg.drift_failure,
+                    f"Recheck pack spend failed: {exc} — no per-call "
+                    "fallback was attempted",
+                )
+            result = self._drift_result(resp, 0, now, target_url)
+            note = self._pack_balance_note()
+            if note:
+                result = StageResult(
+                    result.name, result.outcome,
+                    f"{result.detail}; {note}", cost_units=result.cost_units,
+                )
+            return result
         try:
             outcome = call_paid_endpoint(
                 self.http,
@@ -398,10 +426,73 @@ class GuardedClient:
         if outcome.mode != "paid" or not isinstance(outcome.response, dict):
             return self._failure("drift", cfg.drift_failure,
                                  "Recheck returned no usable result")
-        cost = outcome.price_units
+        return self._drift_result(outcome.response, outcome.price_units, now, target_url)
+
+    def _call_recheck_with_pack(self, target_url: str) -> dict:
+        """One pack-credit Recheck: POST with pack_id, no payment.
+
+        Raises ServiceError on any non-200 (402 exhausted, 410 expired,
+        403 wrong endpoint, 404 unknown pack) — the caller turns that
+        into the stage's failure policy, never a paid retry.
+        """
+        cfg = self.config
+        response = self.http.post(
+            cfg.recheck_url,
+            json={"url": target_url, "pack_id": cfg.recheck_pack_id},
+        )
+        if response.status_code != 200:
+            try:
+                detail = response.json()
+            except ValueError:
+                detail = response.text[:500]
+            raise ServiceError(response.status_code, detail)
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ServiceError(200, "Recheck pack response was not an object")
+        return data
+
+    def _pack_balance_note(self) -> str:
+        """Free pack-balance read -> a status/low-balance note, or "".
+
+        Balance reads are free (POST /v1/recheck/pack-balance). Warns
+        at <=25 credits and again at <=10. Best-effort: a failed read
+        never fails the drift stage.
+        """
+        cfg = self.config
+        balance_url = cfg.recheck_url.rstrip("/") + "/pack-balance"
+        try:
+            response = self.http.post(
+                balance_url, json={"pack_id": cfg.recheck_pack_id}
+            )
+            if response.status_code != 200:
+                return ""
+            data = response.json()
+        except Exception:  # noqa: BLE001 — advisory read only
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        remaining = data.get("credits_remaining")
+        total = data.get("credits_total", 250)
+        if not isinstance(remaining, int):
+            return ""
+        note = f"paid with a recheck pack credit ({remaining} of {total} left)"
+        if remaining <= 10:
+            note += (
+                " — PACK LOW: 10 or fewer credits remain; renewal is a "
+                "new $1.00 pack (POST /v1/recheck/pack) — this guard "
+                "never auto-buys and never falls back to per-call billing"
+            )
+        elif remaining <= 25:
+            note += (
+                " — pack low: 25 or fewer credits remain; renewal is a "
+                "new $1.00 pack (POST /v1/recheck/pack)"
+            )
+        return note
+
+    def _drift_result(self, resp: dict, cost: int, now: float, target_url: str) -> StageResult:
+        cfg = self.config
         if cost:
             self.store.record_spend(cfg.recheck_url, cost, now=now)
-        resp = outcome.response
         status = resp.get("status")
         fingerprint = resp.get("current")
         if not isinstance(fingerprint, dict):

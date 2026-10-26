@@ -21,6 +21,12 @@ anything is signed**:
 | 3 | **RouteVerdict gate** ([RouteVerdict](https://github.com/QuincyGB/route-verdict)) | $0.05, cached | A first-ever payment ≥ $0.10 (configurable) requires a TRUSTED verdict ≥ 80 (configurable) for the target. |
 | 4 | **Your spend caps** | free | Per-payment, per-endpoint-daily, and global-daily caps from your own config, checked against the guard's local ledger *before* signing. It refuses first — never signs and discovers later. |
 
+Stage 2 drift checks can spend from a StallRow recheck pack
+(config `recheck_pack_id` / `recheckPackId`): $0.004 per uncached check, no per-check
+settlement, and the guard warns at 25 and 10 credits remaining
+(balance reads are free). Without a pack, drift checks pay $0.005
+per uncached check as before.
+
 A block in any stage short-circuits the rest (the guard never spends
 check money after a veto), raises/throws `GuardBlocked` with the
 full reason chain, and — allowed or not — every decision is written

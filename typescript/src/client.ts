@@ -11,7 +11,11 @@
  *      asset changed = hard block; price moved more than the
  *      configured % (default 20%) = block; schema/description/other
  *      changes = warn. Inside the TTL (default 24h) the cached
- *      result is used and the stage costs zero.
+ *      result is used and the stage costs zero. With `recheckPackId`
+ *      configured, the check instead spends one credit from a prepaid
+ *      StallRow recheck pack ($1.00 = 250 checks on one endpoint):
+ *      no per-check settlement, and an exhausted or expired pack
+ *      fails the stage — it never falls back to paying per call.
  *   3. RouteVerdict gate (optional, $0.05, cached) — a first-ever
  *      payment at or above the threshold (default $0.10) requires
  *      TRUSTED >= the trust floor (default 80).
@@ -276,6 +280,27 @@ export class X402Guard {
             const note = cached ? "cached Recheck result is stale" : "no cached Recheck result";
             return stage("drift", "skipped", `${note}; no signer — observe mode never pays for checks`);
         }
+        if (cfg.recheckPackId) {
+            // Pack path: the pack id is the credential — StallRow
+            // spends one credit, no settlement occurs, cost is 0.
+            // An exhausted/expired pack fails the stage; the guard
+            // NEVER falls back to per-call payment silently.
+            let payload: Record<string, unknown>;
+            try {
+                payload = await this.packRecheckCall(targetUrl);
+            } catch (exc) {
+                return this.failure(
+                    "drift",
+                    cfg.driftFailure,
+                    `Recheck pack spend failed: ${errMsg(exc)} — no per-call fallback was attempted`,
+                );
+            }
+            const result = this.driftResult(payload, 0, now, targetUrl);
+            const note = await this.packBalanceNote();
+            return note
+                ? { ...result, detail: `${result.detail}; ${note}` }
+                : result;
+        }
         let payload: Record<string, unknown>;
         let cost: number;
         try {
@@ -285,6 +310,64 @@ export class X402Guard {
         } catch (exc) {
             return this.failure("drift", cfg.driftFailure, `Recheck call failed: ${errMsg(exc)}`);
         }
+        return this.driftResult(payload, cost, now, targetUrl);
+    }
+
+    /** One pack-credit Recheck: POST with pack_id, no payment. Throws
+     * on any non-200 (402 exhausted, 410 expired, 403 wrong endpoint,
+     * 404 unknown pack) — the caller applies the failure policy. */
+    private async packRecheckCall(
+        targetUrl: string,
+    ): Promise<Record<string, unknown>> {
+        const cfg = this.config;
+        const res = await this.rawFetch(cfg.recheckUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ url: targetUrl, pack_id: cfg.recheckPackId }),
+        });
+        if (res.status !== 200) {
+            throw new Error(`pack spend failed: HTTP ${res.status}`);
+        }
+        return (await res.json()) as Record<string, unknown>;
+    }
+
+    /** Free pack-balance read -> a status/low-balance note, or "".
+     * Warns at <=25 credits and again at <=10. Best-effort: a failed
+     * read never fails the drift stage. */
+    private async packBalanceNote(): Promise<string> {
+        const cfg = this.config;
+        try {
+            const res = await this.rawFetch(`${cfg.recheckUrl}/pack-balance`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ pack_id: cfg.recheckPackId }),
+            });
+            if (res.status !== 200) return "";
+            const data = (await res.json()) as Record<string, unknown>;
+            const remaining = data.credits_remaining;
+            const total = data.credits_total ?? 250;
+            if (typeof remaining !== "number") return "";
+            let note = `paid with a recheck pack credit (${remaining} of ${total} left)`;
+            if (remaining <= 10) {
+                note +=
+                    " — PACK LOW: 10 or fewer credits remain; renewal is a new $1.00 pack (POST /v1/recheck/pack) — this guard never auto-buys and never falls back to per-call billing";
+            } else if (remaining <= 25) {
+                note +=
+                    " — pack low: 25 or fewer credits remain; renewal is a new $1.00 pack (POST /v1/recheck/pack)";
+            }
+            return note;
+        } catch {
+            return "";
+        }
+    }
+
+    private driftResult(
+        payload: Record<string, unknown>,
+        cost: number,
+        now: number,
+        targetUrl: string,
+    ): StageResult {
+        const cfg = this.config;
         if (cost > 0) this.store.recordSpend(cfg.recheckUrl, cost, now);
         const status = payload.status as string | undefined;
         const fingerprint =

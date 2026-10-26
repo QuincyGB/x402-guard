@@ -438,3 +438,98 @@ describe("caps, observe mode, audit", () => {
         ]);
     });
 });
+
+
+// --- recheck pack spending (drift stage) ---------------------------------------
+
+describe("recheck pack (drift stage)", () => {
+    function makePackWorld(balance = 249) {
+        const stats = { packSpends: 0, balanceReads: 0, signedRequests: 0 };
+        const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+            const req = input instanceof Request ? input : new Request(String(input), init);
+            if (req.headers.get("payment-signature")) stats.signedRequests += 1;
+            const url = new URL(req.url);
+            if (url.host !== "stall-row-production.up.railway.app") {
+                throw new Error(`unexpected host: ${url.host}`);
+            }
+            const body = JSON.parse(await req.text()) as { pack_id?: string };
+            if (url.pathname === "/v1/recheck/pack-balance") {
+                stats.balanceReads += 1;
+                return Response.json({
+                    pack_id: body.pack_id,
+                    credits_total: 250,
+                    credits_remaining: balance,
+                    expires_at: "2027-01-23T00:00:00Z",
+                    expired: false,
+                });
+            }
+            if (url.pathname === "/v1/recheck") {
+                if (body.pack_id === "pack_test") {
+                    stats.packSpends += 1;
+                    return Response.json(recheckResponse("BASELINE"));
+                }
+                if (body.pack_id === "pack_empty") {
+                    return Response.json(
+                        { error: "pack exhausted", code: "pack_exhausted" },
+                        { status: 402 },
+                    );
+                }
+                return Response.json({ error: "unknown pack_id" }, { status: 404 });
+            }
+            throw new Error(`unexpected path: ${url.pathname}`);
+        }) as unknown as typeof fetch;
+        return { fetchImpl, stats };
+    }
+
+    const packConfig = {
+        settledEnabled: false,
+        routeVerdictEnabled: false,
+        recheckPackId: "pack_test",
+    };
+
+    it("spends a pack credit instead of paying per call", async () => {
+        const world = makePackWorld(249);
+        const { guard } = makeGuard(world as never, { config: packConfig });
+        const decision = await guard.evaluate(TARGET, 20_000);
+        const drift = decision.stages[1];
+        expect(drift.outcome).toBe("pass");
+        expect(drift.costUnits).toBe(0);
+        expect(drift.detail).toContain("pack credit");
+        expect(drift.detail).toContain("249 of 250");
+        expect(world.stats.packSpends).toBe(1);
+        expect(world.stats.balanceReads).toBe(1);
+        expect(world.stats.signedRequests).toBe(0);
+    });
+
+    it("warns when the pack is low", async () => {
+        const world = makePackWorld(10);
+        const { guard } = makeGuard(world as never, { config: packConfig });
+        const decision = await guard.evaluate(TARGET, 20_000);
+        expect(decision.stages[1].detail).toContain("PACK LOW");
+        expect(decision.stages[1].detail).toContain("never falls back");
+    });
+
+    it("exhausted pack fails without a per-call fallback", async () => {
+        const world = makePackWorld();
+        const { guard } = makeGuard(world as never, {
+            config: { ...packConfig, recheckPackId: "pack_empty" },
+        });
+        const decision = await guard.evaluate(TARGET, 20_000);
+        const drift = decision.stages[1];
+        expect(drift.outcome).toBe("warn"); // default driftFailure policy
+        expect(drift.detail).toContain("no per-call fallback");
+        expect(world.stats.packSpends).toBe(0);
+        expect(world.stats.signedRequests).toBe(0);
+    });
+
+    it("never spends a pack credit in observe mode (no signer)", async () => {
+        const world = makePackWorld();
+        const { guard } = makeGuard(world as never, {
+            config: packConfig,
+            signer: null,
+        });
+        const decision = await guard.evaluate(TARGET, 20_000);
+        expect(decision.stages[1].outcome).toBe("skipped");
+        expect(world.stats.packSpends).toBe(0);
+    });
+});

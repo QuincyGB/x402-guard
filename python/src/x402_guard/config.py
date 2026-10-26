@@ -29,11 +29,18 @@ class GuardConfig:
     Stage toggles and thresholds:
       settled_enabled / settled_mcp_url / settled_timeout
           The free Settled pre-flight (stage 1).
-      drift_enabled / recheck_url / drift_ttl_seconds /
-      price_change_block_pct / drift_failure
+      drift_enabled / recheck_url / recheck_pack_id /
+      drift_ttl_seconds / price_change_block_pct / drift_failure
           The StallRow Recheck drift check (stage 2). Results are
           cached for drift_ttl_seconds; a RouteVerdict gate verdict is
-          cached for the same TTL. drift_failure is what happens when
+          cached for the same TTL. When recheck_pack_id is set, drift
+          checks spend credits from that StallRow recheck pack
+          (POST /v1/recheck/pack: $1.00 = 250 checks on one endpoint)
+          instead of paying $0.005 per uncached check — the pack id is
+          the credential, no per-check settlement occurs, and an
+          exhausted (402) or expired (410) pack fails the stage under
+          drift_failure WITHOUT falling back to per-call payment.
+          drift_failure is what happens when
           the Recheck call itself fails: "warn" (pass through with a
           warning) or "block".
       route_verdict_enabled / route_verdict_url /
@@ -63,6 +70,7 @@ class GuardConfig:
 
     drift_enabled: bool = True
     recheck_url: str = DEFAULT_RECHECK_URL
+    recheck_pack_id: str | None = None
     drift_ttl_seconds: float = 86_400.0
     price_change_block_pct: float = 20.0
     drift_failure: str = "warn"
@@ -99,6 +107,10 @@ class GuardConfig:
           X402_GUARD_ROUTE_VERDICT_ENABLED   booleans (1/0, true/false…)
           X402_GUARD_RECHECK_URL, X402_GUARD_ROUTE_VERDICT_URL,
           X402_GUARD_SETTLED_MCP_URL         URLs
+          X402_GUARD_RECHECK_PACK_ID         StallRow recheck pack id
+                                             (spend pack credits for
+                                             drift checks, no per-call
+                                             payment, no fallback)
           X402_GUARD_DRIFT_TTL_SECONDS       seconds (float)
           X402_GUARD_PRICE_CHANGE_BLOCK_PCT  percent (float)
           X402_GUARD_DRIFT_FAILURE, X402_GUARD_ROUTE_VERDICT_FAILURE
@@ -143,6 +155,7 @@ class GuardConfig:
             settled_mcp_url=get("SETTLED_MCP_URL") or defaults.settled_mcp_url,
             drift_enabled=get_bool("DRIFT_ENABLED", defaults.drift_enabled),
             recheck_url=get("RECHECK_URL") or defaults.recheck_url,
+            recheck_pack_id=get("RECHECK_PACK_ID") or defaults.recheck_pack_id,
             drift_ttl_seconds=get_float("DRIFT_TTL_SECONDS", defaults.drift_ttl_seconds),
             price_change_block_pct=get_float(
                 "PRICE_CHANGE_BLOCK_PCT", defaults.price_change_block_pct
