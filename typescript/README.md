@@ -21,7 +21,15 @@ through Verdict Row **before anything is signed**:
 3. **RouteVerdict gate (optional, $0.05, cached)** — a first-ever
    payment at or above a threshold (default $0.10) requires a
    TRUSTED verdict ≥ your trust floor (default 80).
-4. **Your spend caps** — per-payment, per-endpoint-daily, and
+4. **Pre-Trade Guard screen (opt-in, $0.005)** — off by default
+   (`preTradeEnabled: true` turns it on). Payments at or above a
+   threshold (default $0.10) are screened against the **payTo
+   itself**: StallRow's Pre-Trade Guard reads the payTo's listing
+   history and rotations from the Verdict Index, a wallet snapshot,
+   and the OFAC SDN snapshot. `ABORT` → block. `CAUTION` →
+   warn-and-log (or block with `preTradeCaution: "block"`).
+   `PROCEED` → pass.
+5. **Your spend caps** — per-payment, per-endpoint-daily, and
    global-daily caps from your own config, checked against the
    guard's local ledger *before* signing. The guard refuses first;
    it never signs and discovers later.
@@ -79,6 +87,7 @@ without paying anything.
 | Settled pre-flight | free | every payment |
 | Recheck drift check | $0.005 | first look per endpoint per TTL (24h default) |
 | RouteVerdict gate | $0.05 | first big payment (≥ $0.10 default) per TTL |
+| Pre-Trade Guard screen | $0.005 | opt-in; payments ≥ $0.10 default |
 | The guard itself | $0 | it's a library |
 
 ## What it cannot do

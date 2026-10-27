@@ -7,7 +7,8 @@ every x402 payment is pre-flighted before anything is signed:
   2. Drift check (Recheck $0.005, cached daily)
                                  — the endpoint's terms haven't moved
   3. RouteVerdict gate ($0.05)   — big first payments need TRUSTED
-  4. Your own spend caps         — enforced before signing, never after
+  4. Pre-Trade Guard ($0.005)    — opt-in payTo screen (ABORT blocks)
+  5. Your own spend caps         — enforced before signing, never after
 
 Blocks raise GuardBlocked with the full reason chain; every decision
 lands in a local audit log you can read.

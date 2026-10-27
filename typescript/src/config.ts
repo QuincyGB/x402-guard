@@ -9,6 +9,8 @@ export const SETTLED_MCP_URL = "https://settled.tools/mcp/free";
 export const DEFAULT_RECHECK_URL = "https://stall-row-production.up.railway.app/v1/recheck";
 export const DEFAULT_ROUTE_VERDICT_URL =
     "https://route-verdict-production.up.railway.app/v1/check";
+export const DEFAULT_PRE_TRADE_URL =
+    "https://stall-row-production.up.railway.app/v1/pre-trade-guard";
 
 const USDC_UNITS_PER_DOLLAR = 1_000_000;
 
@@ -37,7 +39,17 @@ export interface GuardConfigOptions {
     routeVerdictThresholdUnits?: number;
     routeVerdictMinTrust?: number;
     routeVerdictFailure?: FailurePolicy;
-    /** Stage 4: spend caps (null = no cap). */
+    /** Stage 4: Pre-Trade Guard screen (OPT-IN, default off).
+     * Payments at or above the threshold are screened against the
+     * payTo (listing history, rotations, wallet, OFAC snapshot).
+     * ABORT blocks; CAUTION warns-and-logs unless preTradeCaution
+     * is "block". */
+    preTradeEnabled?: boolean;
+    preTradeUrl?: string;
+    preTradeThresholdUnits?: number;
+    preTradeCaution?: FailurePolicy;
+    preTradeFailure?: FailurePolicy;
+    /** Stage 5: spend caps (null = no cap). */
     maxPaymentUnits?: number | null;
     perEndpointDailyCapUnits?: number | null;
     globalDailyCapUnits?: number | null;
@@ -61,6 +73,11 @@ export interface GuardConfig {
     routeVerdictThresholdUnits: number;
     routeVerdictMinTrust: number;
     routeVerdictFailure: FailurePolicy;
+    preTradeEnabled: boolean;
+    preTradeUrl: string;
+    preTradeThresholdUnits: number;
+    preTradeCaution: FailurePolicy;
+    preTradeFailure: FailurePolicy;
     maxPaymentUnits: number | null;
     perEndpointDailyCapUnits: number | null;
     globalDailyCapUnits: number | null;
@@ -84,6 +101,11 @@ export function resolveConfig(options: GuardConfigOptions = {}): GuardConfig {
         routeVerdictThresholdUnits: options.routeVerdictThresholdUnits ?? 100_000,
         routeVerdictMinTrust: options.routeVerdictMinTrust ?? 80,
         routeVerdictFailure: options.routeVerdictFailure ?? "warn",
+        preTradeEnabled: options.preTradeEnabled ?? false,
+        preTradeUrl: options.preTradeUrl ?? DEFAULT_PRE_TRADE_URL,
+        preTradeThresholdUnits: options.preTradeThresholdUnits ?? 100_000,
+        preTradeCaution: options.preTradeCaution ?? "warn",
+        preTradeFailure: options.preTradeFailure ?? "warn",
         maxPaymentUnits: options.maxPaymentUnits ?? null,
         perEndpointDailyCapUnits: options.perEndpointDailyCapUnits ?? null,
         globalDailyCapUnits: options.globalDailyCapUnits ?? null,
@@ -95,6 +117,12 @@ export function resolveConfig(options: GuardConfigOptions = {}): GuardConfig {
     }
     if (config.routeVerdictFailure !== "warn" && config.routeVerdictFailure !== "block") {
         throw new Error('routeVerdictFailure must be "warn" or "block"');
+    }
+    if (config.preTradeCaution !== "warn" && config.preTradeCaution !== "block") {
+        throw new Error('preTradeCaution must be "warn" or "block"');
+    }
+    if (config.preTradeFailure !== "warn" && config.preTradeFailure !== "block") {
+        throw new Error('preTradeFailure must be "warn" or "block"');
     }
     return config;
 }
@@ -148,6 +176,11 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
         routeVerdictThresholdUnits: getUsdUnits("ROUTE_VERDICT_THRESHOLD_USD"),
         routeVerdictMinTrust: getFloat("ROUTE_VERDICT_MIN_TRUST"),
         routeVerdictFailure: failure("ROUTE_VERDICT_FAILURE"),
+        preTradeEnabled: getBool("PRE_TRADE_ENABLED"),
+        preTradeUrl: get("PRE_TRADE_URL"),
+        preTradeThresholdUnits: getUsdUnits("PRE_TRADE_THRESHOLD_USD"),
+        preTradeCaution: failure("PRE_TRADE_CAUTION"),
+        preTradeFailure: failure("PRE_TRADE_FAILURE"),
         maxPaymentUnits: getUsdUnits("MAX_PAYMENT_USD"),
         perEndpointDailyCapUnits: getUsdUnits("PER_ENDPOINT_DAILY_CAP_USD"),
         globalDailyCapUnits: getUsdUnits("GLOBAL_DAILY_CAP_USD"),

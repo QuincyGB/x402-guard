@@ -532,7 +532,7 @@ def test_audit_log_records_decisions_and_costs(tmp_path):
     assert entry["outcome"] == "paid"
     assert entry["check_cost_units"] == 5000
     assert [s["name"] for s in entry["stages"]] == [
-        "settled", "drift", "route_verdict", "caps",
+        "settled", "drift", "route_verdict", "pre_trade", "caps",
     ]
     assert entry["amount_units"] == 20_000
     assert entry["dry_run"] is False

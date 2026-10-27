@@ -24,7 +24,15 @@ The pipeline (same semantics in the TypeScript package):
      payment at or above the configured amount threshold (default
      $0.10) requires a TRUSTED verdict at or above the configured
      trust score (default 80) for the target.
-  4. Spend caps — per-payment, per-endpoint-daily, and global-daily
+  4. Pre-Trade Guard screen (OPT-IN, $0.005) — payments at or above
+     the configured threshold (default $0.10) are screened against
+     the payTo itself: StallRow's Pre-Trade Guard reads the payTo's
+     listing history and rotations from the Verdict Index, its
+     wallet snapshot, and the bundled OFAC snapshot. ABORT blocks;
+     CAUTION warns-and-logs by default (or blocks when configured);
+     PROCEED passes. The payTo comes from the payment challenge, or
+     from the cached drift fingerprint for evaluate().
+  5. Spend caps — per-payment, per-endpoint-daily, and global-daily
      caps from the buyer's own config, checked against the guard's
      local spend ledger BEFORE signing. Refusal here never signs
      first and discovers later.
@@ -69,7 +77,7 @@ __all__ = [
 
 @dataclass
 class StageResult:
-    name: str  # settled | drift | route_verdict | caps
+    name: str  # settled | drift | route_verdict | pre_trade | caps
     outcome: str  # pass | warn | block | skipped
     detail: str
     cost_units: int = 0
@@ -216,7 +224,15 @@ class GuardedClient:
         gate threshold, caps) are skipped as "price not supplied".
         Writes an audit entry with outcome "evaluated".
         """
-        decision = self._pipeline(target_url, amount_units, spend_url=target_url)
+        pay_to: str | None = None
+        cached = self.store.get_check(target_url)
+        if cached is not None and isinstance(cached.get("fingerprint"), dict):
+            candidate = cached["fingerprint"].get("payTo")
+            if isinstance(candidate, str) and candidate:
+                pay_to = candidate
+        decision = self._pipeline(
+            target_url, amount_units, spend_url=target_url, pay_to=pay_to
+        )
         self._write_audit(decision, outcome_mode="evaluated", dry_run=self.account is None)
         return decision
 
@@ -268,7 +284,14 @@ class GuardedClient:
             return GuardResult(probe, decision)
 
         amount_units = probe.price_units
-        decision = self._pipeline(target_url, amount_units, spend_url=pay_url)
+        pay_to = None
+        if isinstance(probe.requirement, dict):
+            candidate = probe.requirement.get("payTo")
+            if isinstance(candidate, str) and candidate:
+                pay_to = candidate
+        decision = self._pipeline(
+            target_url, amount_units, spend_url=pay_url, pay_to=pay_to
+        )
 
         if decision.blocked:
             self._write_audit(decision, outcome_mode="blocked",
@@ -298,7 +321,12 @@ class GuardedClient:
     # ------------------------------------------------------------------
 
     def _pipeline(
-        self, target_url: str, amount_units: int | None, *, spend_url: str
+        self,
+        target_url: str,
+        amount_units: int | None,
+        *,
+        spend_url: str,
+        pay_to: str | None = None,
     ) -> GuardDecision:
         cfg = self.config
         stages: list[StageResult] = []
@@ -340,7 +368,17 @@ class GuardedClient:
         else:
             stages.append(self._route_verdict_stage(target_url, amount_units))
 
-        # --- 4. Spend caps -------------------------------------------------
+        # --- 4. Pre-Trade Guard screen (opt-in) ---------------------------
+        if _blocked(stages):
+            stages.append(
+                StageResult(
+                    "pre_trade", "skipped", "not run — an earlier stage blocked"
+                )
+            )
+        else:
+            stages.append(self._pre_trade_stage(target_url, amount_units, pay_to))
+
+        # --- 5. Spend caps -------------------------------------------------
         if _blocked(stages):
             stages.append(
                 StageResult("caps", "skipped", "not run — an earlier stage blocked")
@@ -640,7 +678,106 @@ class GuardedClient:
         )
 
     # ------------------------------------------------------------------
-    # Stage 4: caps
+    # Stage 4: Pre-Trade Guard screen
+    # ------------------------------------------------------------------
+
+    def _pre_trade_stage(
+        self, target_url: str, amount_units: int | None, pay_to: str | None
+    ) -> StageResult:
+        cfg = self.config
+        if not cfg.pre_trade_enabled:
+            return StageResult("pre_trade", "skipped", "disabled in config (opt-in)")
+        if amount_units is None:
+            return StageResult(
+                "pre_trade", "skipped", "payment amount not supplied"
+            )
+        if amount_units < cfg.pre_trade_threshold_units:
+            return StageResult(
+                "pre_trade",
+                "skipped",
+                f"payment {format_usd(amount_units)} is below the "
+                f"{format_usd(cfg.pre_trade_threshold_units)} pre-trade threshold",
+            )
+        if not pay_to:
+            return StageResult(
+                "pre_trade", "skipped",
+                "no payTo known for the target (no payment challenge "
+                "payTo and no cached drift fingerprint)",
+            )
+        if self.account is None:
+            return StageResult(
+                "pre_trade", "skipped", "dry-run never pays for checks"
+            )
+        try:
+            outcome = call_paid_endpoint(
+                self.http,
+                cfg.pre_trade_url,
+                {
+                    "pay_to": pay_to,
+                    "amount": str(amount_units),
+                    "resource": target_url,
+                },
+                account=self.account,
+                budget=self.budget,
+            )
+        except ServiceError as exc:
+            return self._failure("pre_trade", cfg.pre_trade_failure,
+                                 f"Pre-Trade Guard call failed: {exc}")
+        if outcome.mode == "blocked":
+            return StageResult(
+                "pre_trade", "block",
+                f"Pre-Trade Guard check refused by the spend budget: {outcome.note}",
+            )
+        resp = outcome.response
+        if (
+            outcome.mode != "paid"
+            or not isinstance(resp, dict)
+            or "verdict" not in resp
+        ):
+            return self._failure(
+                "pre_trade", cfg.pre_trade_failure,
+                "Pre-Trade Guard returned no usable verdict",
+            )
+        cost = outcome.price_units
+        if cost:
+            self.store.record_spend(cfg.pre_trade_url, cost, now=self._now())
+        verdict = str(resp["verdict"])
+        risk = resp.get("risk_score")
+        reasons = resp.get("reasons") or []
+        why = "; ".join(str(r) for r in reasons[:3])
+        suffix = f" — {why}" if why else ""
+        if verdict == "ABORT":
+            return StageResult(
+                "pre_trade", "block",
+                f"Pre-Trade Guard: ABORT (risk {risk}){suffix}",
+                cost_units=cost,
+            )
+        if verdict == "CAUTION":
+            if cfg.pre_trade_caution == "block":
+                return StageResult(
+                    "pre_trade", "block",
+                    f"Pre-Trade Guard: CAUTION (risk {risk}) blocked per "
+                    f"pre_trade_caution=block{suffix}",
+                    cost_units=cost,
+                )
+            return StageResult(
+                "pre_trade", "warn",
+                f"Pre-Trade Guard: CAUTION (risk {risk}){suffix}",
+                cost_units=cost,
+            )
+        if verdict == "PROCEED":
+            return StageResult(
+                "pre_trade", "pass",
+                f"Pre-Trade Guard: PROCEED (risk {risk})",
+                cost_units=cost,
+            )
+        return self._failure(
+            "pre_trade", cfg.pre_trade_failure,
+            f"Pre-Trade Guard answered with an unrecognized verdict: {verdict!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Stage 5: caps
     # ------------------------------------------------------------------
 
     def _caps_stage(self, amount_units: int | None, spend_url: str) -> StageResult:

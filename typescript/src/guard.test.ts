@@ -434,6 +434,7 @@ describe("caps, observe mode, audit", () => {
             "settled",
             "drift",
             "route_verdict",
+            "pre_trade",
             "caps",
         ]);
     });

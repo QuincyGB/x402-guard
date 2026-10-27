@@ -15,6 +15,7 @@ from .settled import SETTLED_MCP_URL
 
 DEFAULT_RECHECK_URL = "https://stall-row-production.up.railway.app/v1/recheck"
 DEFAULT_ROUTE_VERDICT_URL = "https://route-verdict-production.up.railway.app/v1/check"
+DEFAULT_PRE_TRADE_URL = "https://stall-row-production.up.railway.app/v1/pre-trade-guard"
 
 USDC_UNITS_PER_DOLLAR = 1_000_000
 
@@ -50,8 +51,21 @@ class GuardConfig:
           above the threshold require TRUSTED >= min trust.
           route_verdict_failure is the on-error policy, same words as
           drift_failure.
+      pre_trade_enabled / pre_trade_url / pre_trade_threshold_units /
+      pre_trade_caution / pre_trade_failure
+          The Pre-Trade Guard screen (stage 4, OPT-IN, default off):
+          payments at or above the threshold are screened by StallRow's
+          Pre-Trade Guard ($0.005 per fresh call) against the payTo's
+          listing history, rotations, wallet snapshot, and the OFAC
+          snapshot. ABORT always blocks; CAUTION warns-and-logs by
+          default (pre_trade_caution="warn") or blocks
+          (pre_trade_caution="block"); PROCEED passes.
+          pre_trade_failure is the on-error policy, same words as
+          drift_failure. The stage needs the payTo — taken from the
+          payment challenge in pay(), or from the cached drift
+          fingerprint in evaluate(); with neither, it skips.
 
-    Spend caps (stage 4), all optional (None = no cap):
+    Spend caps (stage 5), all optional (None = no cap):
       max_payment_units            one payment may never exceed this
       per_endpoint_daily_cap_units per paid-URL per UTC day
       global_daily_cap_units       everything per UTC day (payments
@@ -81,6 +95,12 @@ class GuardConfig:
     route_verdict_min_trust: float = 80.0
     route_verdict_failure: str = "warn"
 
+    pre_trade_enabled: bool = False  # opt-in
+    pre_trade_url: str = DEFAULT_PRE_TRADE_URL
+    pre_trade_threshold_units: int = 100_000  # $0.10
+    pre_trade_caution: str = "warn"  # warn | block
+    pre_trade_failure: str = "warn"
+
     max_payment_units: int | None = None
     per_endpoint_daily_cap_units: int | None = None
     global_daily_cap_units: int | None = None
@@ -93,6 +113,10 @@ class GuardConfig:
             raise ValueError('drift_failure must be "warn" or "block"')
         if self.route_verdict_failure not in ("warn", "block"):
             raise ValueError('route_verdict_failure must be "warn" or "block"')
+        if self.pre_trade_caution not in ("warn", "block"):
+            raise ValueError('pre_trade_caution must be "warn" or "block"')
+        if self.pre_trade_failure not in ("warn", "block"):
+            raise ValueError('pre_trade_failure must be "warn" or "block"')
         if self.drift_ttl_seconds < 0:
             raise ValueError("drift_ttl_seconds cannot be negative")
         if self.price_change_block_pct < 0:
@@ -104,8 +128,10 @@ class GuardConfig:
 
         Recognized (all optional):
           X402_GUARD_SETTLED_ENABLED, X402_GUARD_DRIFT_ENABLED,
-          X402_GUARD_ROUTE_VERDICT_ENABLED   booleans (1/0, true/false…)
+          X402_GUARD_ROUTE_VERDICT_ENABLED,
+          X402_GUARD_PRE_TRADE_ENABLED       booleans (1/0, true/false…)
           X402_GUARD_RECHECK_URL, X402_GUARD_ROUTE_VERDICT_URL,
+          X402_GUARD_PRE_TRADE_URL,
           X402_GUARD_SETTLED_MCP_URL         URLs
           X402_GUARD_RECHECK_PACK_ID         StallRow recheck pack id
                                              (spend pack credits for
@@ -113,9 +139,11 @@ class GuardConfig:
                                              payment, no fallback)
           X402_GUARD_DRIFT_TTL_SECONDS       seconds (float)
           X402_GUARD_PRICE_CHANGE_BLOCK_PCT  percent (float)
-          X402_GUARD_DRIFT_FAILURE, X402_GUARD_ROUTE_VERDICT_FAILURE
-                                             "warn" | "block"
+          X402_GUARD_DRIFT_FAILURE, X402_GUARD_ROUTE_VERDICT_FAILURE,
+          X402_GUARD_PRE_TRADE_FAILURE       "warn" | "block"
+          X402_GUARD_PRE_TRADE_CAUTION       "warn" | "block"
           X402_GUARD_ROUTE_VERDICT_THRESHOLD_USD,
+          X402_GUARD_PRE_TRADE_THRESHOLD_USD,
           X402_GUARD_ROUTE_VERDICT_MIN_TRUST,
           X402_GUARD_MAX_PAYMENT_USD,
           X402_GUARD_PER_ENDPOINT_DAILY_CAP_USD,
@@ -175,6 +203,19 @@ class GuardConfig:
             ),
             route_verdict_failure=(
                 get("ROUTE_VERDICT_FAILURE") or defaults.route_verdict_failure
+            ).lower(),
+            pre_trade_enabled=get_bool("PRE_TRADE_ENABLED", defaults.pre_trade_enabled),
+            pre_trade_url=get("PRE_TRADE_URL") or defaults.pre_trade_url,
+            pre_trade_threshold_units=(
+                get_usd_units("PRE_TRADE_THRESHOLD_USD")
+                if get("PRE_TRADE_THRESHOLD_USD") is not None
+                else defaults.pre_trade_threshold_units
+            ),
+            pre_trade_caution=(
+                get("PRE_TRADE_CAUTION") or defaults.pre_trade_caution
+            ).lower(),
+            pre_trade_failure=(
+                get("PRE_TRADE_FAILURE") or defaults.pre_trade_failure
             ).lower(),
             max_payment_units=get_usd_units("MAX_PAYMENT_USD"),
             per_endpoint_daily_cap_units=get_usd_units("PER_ENDPOINT_DAILY_CAP_USD"),

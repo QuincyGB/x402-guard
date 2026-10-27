@@ -19,7 +19,14 @@
  *   3. RouteVerdict gate (optional, $0.05, cached) — a first-ever
  *      payment at or above the threshold (default $0.10) requires
  *      TRUSTED >= the trust floor (default 80).
- *   4. Spend caps — per-payment, per-endpoint-daily, global-daily,
+ *   4. Pre-Trade Guard screen (OPT-IN, $0.005) — payments at or
+ *      above the threshold (default $0.10) are screened against the
+ *      payTo itself (Verdict Index history and rotations, wallet
+ *      snapshot, bundled OFAC snapshot). ABORT blocks; CAUTION
+ *      warns-and-logs by default (or blocks when configured);
+ *      PROCEED passes. The payTo comes from the payment challenge,
+ *      or from the cached drift fingerprint for evaluate().
+ *   5. Spend caps — per-payment, per-endpoint-daily, global-daily,
  *      checked against the local spend ledger BEFORE signing.
  *
  * A block short-circuits the remaining stages (recorded as skipped)
@@ -52,7 +59,7 @@ import { JsonStore } from "./store";
 import { BASE_NETWORK, formatUsd, parsePaymentRequired, selectRequirement } from "./x402";
 
 export interface StageResult {
-    name: string; // settled | drift | route_verdict | caps
+    name: string; // settled | drift | route_verdict | pre_trade | caps
     outcome: "pass" | "warn" | "block" | "skipped";
     detail: string;
     costUnits: number;
@@ -145,7 +152,16 @@ export class X402Guard {
 
     /** Run the policy pipeline for a target without paying it. */
     async evaluate(targetUrl: string, amountUnits?: number): Promise<GuardDecision> {
-        const decision = await this.runPipeline(targetUrl, amountUnits ?? null, targetUrl);
+        const cached = this.store.getCheck(targetUrl);
+        const candidate = cached?.fingerprint?.payTo;
+        const payTo =
+            typeof candidate === "string" && candidate !== "" ? candidate : null;
+        const decision = await this.runPipeline(
+            targetUrl,
+            amountUnits ?? null,
+            targetUrl,
+            payTo,
+        );
         this.writeAudit(decision, "evaluated");
         return decision;
     }
@@ -162,15 +178,21 @@ export class X402Guard {
         const probe = await this.rawFetch(probeInput as string, init);
         if (probe.status !== 402) return probe;
         let amountUnits: number;
+        let payTo: string | null;
         try {
             const challenge = await parsePaymentRequired(probe);
-            amountUnits = Number(selectRequirement(challenge).amount);
+            const requirement = selectRequirement(challenge);
+            amountUnits = Number(requirement.amount);
+            payTo =
+                typeof requirement.payTo === "string" && requirement.payTo !== ""
+                    ? requirement.payTo
+                    : null;
         } catch {
             // A 402 we cannot parse cannot be vetted; hand it back raw
             // rather than guessing at someone else's money.
             return probe;
         }
-        const decision = await this.runPipeline(url, amountUnits, url);
+        const decision = await this.runPipeline(url, amountUnits, url, payTo);
         if (decision.blocked) {
             this.writeAudit(decision, "blocked");
             if (this.signer) throw new GuardBlockedError(decision);
@@ -198,6 +220,7 @@ export class X402Guard {
         targetUrl: string,
         amountUnits: number | null,
         spendUrl: string,
+        payTo: string | null,
     ): Promise<GuardDecision> {
         const cfg = this.config;
         const stages: StageResult[] = [];
@@ -233,7 +256,14 @@ export class X402Guard {
                 : await this.routeVerdictStage(targetUrl, amountUnits),
         );
 
-        // 4. Spend caps
+        // 4. Pre-Trade Guard screen (opt-in)
+        stages.push(
+            isBlocked(stages)
+                ? stage("pre_trade", "skipped", "not run — an earlier stage blocked")
+                : await this.preTradeStage(targetUrl, amountUnits, payTo),
+        );
+
+        // 5. Spend caps
         stages.push(
             isBlocked(stages)
                 ? stage("caps", "skipped", "not run — an earlier stage blocked")
@@ -528,7 +558,114 @@ export class X402Guard {
     }
 
     // ------------------------------------------------------------------
-    // Stage 4: caps
+    // Stage 4: Pre-Trade Guard screen
+    // ------------------------------------------------------------------
+
+    private async preTradeStage(
+        targetUrl: string,
+        amountUnits: number | null,
+        payTo: string | null,
+    ): Promise<StageResult> {
+        const cfg = this.config;
+        if (!cfg.preTradeEnabled) {
+            return stage("pre_trade", "skipped", "disabled in config (opt-in)");
+        }
+        if (amountUnits === null) {
+            return stage("pre_trade", "skipped", "payment amount not supplied");
+        }
+        if (amountUnits < cfg.preTradeThresholdUnits) {
+            return stage(
+                "pre_trade",
+                "skipped",
+                `payment ${formatUsd(amountUnits)} is below the ` +
+                    `${formatUsd(cfg.preTradeThresholdUnits)} pre-trade threshold`,
+            );
+        }
+        if (!payTo) {
+            return stage(
+                "pre_trade",
+                "skipped",
+                "no payTo known for the target (no payment challenge " +
+                    "payTo and no cached drift fingerprint)",
+            );
+        }
+        if (!this.signer) {
+            return stage(
+                "pre_trade",
+                "skipped",
+                "no signer — observe mode never pays for checks",
+            );
+        }
+        let payload: Record<string, unknown>;
+        let cost: number;
+        try {
+            ({ payload, priceUnits: cost } = await this.paidCheckCall(cfg.preTradeUrl, {
+                pay_to: payTo,
+                amount: String(amountUnits),
+                resource: targetUrl,
+            }));
+        } catch (exc) {
+            return this.failure(
+                "pre_trade",
+                cfg.preTradeFailure,
+                `Pre-Trade Guard call failed: ${errMsg(exc)}`,
+            );
+        }
+        if (typeof payload.verdict !== "string") {
+            return this.failure(
+                "pre_trade",
+                cfg.preTradeFailure,
+                "Pre-Trade Guard returned no usable verdict",
+            );
+        }
+        if (cost > 0) this.store.recordSpend(cfg.preTradeUrl, cost, this.nowFn());
+        const verdict = payload.verdict;
+        const risk = payload.risk_score;
+        const reasons = Array.isArray(payload.reasons) ? payload.reasons : [];
+        const why = reasons.slice(0, 3).map(String).join("; ");
+        const suffix = why ? ` — ${why}` : "";
+        if (verdict === "ABORT") {
+            return stage(
+                "pre_trade",
+                "block",
+                `Pre-Trade Guard: ABORT (risk ${String(risk)})${suffix}`,
+                cost,
+            );
+        }
+        if (verdict === "CAUTION") {
+            if (cfg.preTradeCaution === "block") {
+                return stage(
+                    "pre_trade",
+                    "block",
+                    `Pre-Trade Guard: CAUTION (risk ${String(risk)}) blocked per ` +
+                        `preTradeCaution=block${suffix}`,
+                    cost,
+                );
+            }
+            return stage(
+                "pre_trade",
+                "warn",
+                `Pre-Trade Guard: CAUTION (risk ${String(risk)})${suffix}`,
+                cost,
+            );
+        }
+        if (verdict === "PROCEED") {
+            return stage(
+                "pre_trade",
+                "pass",
+                `Pre-Trade Guard: PROCEED (risk ${String(risk)})`,
+                cost,
+            );
+        }
+        return this.failure(
+            "pre_trade",
+            cfg.preTradeFailure,
+            `Pre-Trade Guard answered with an unrecognized verdict: ${verdict}`,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 5: caps
     // ------------------------------------------------------------------
 
     private capsStage(amountUnits: number | null, spendUrl: string): StageResult {
@@ -580,7 +717,8 @@ export class X402Guard {
     // ------------------------------------------------------------------
 
     /** A paid call to one of the fleet's check services (Recheck /
-     * RouteVerdict), through the same paying fetch as target payments. */
+     * RouteVerdict / Pre-Trade Guard), through the same paying fetch
+     * as target payments. */
     private async paidCheckCall(
         url: string,
         body: Record<string, unknown>,
